@@ -1,0 +1,85 @@
+# Pipeline: PRs get lint/test/build only. Pushes to main build, push to Docker Hub,
+# deploy to the Azure "staging" slot (green), smoke-test it, then swap into production (blue).
+# The previous version stays in the staging slot after the swap, so rollback = swap again.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # for Azure OIDC login
+
+env:
+  IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/todo-service
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+
+jobs:
+  build:
+    uses: ./.github/workflows/reusable-node-build.yml
+    with:
+      image-name: ${{ vars.DOCKERHUB_USERNAME }}/todo-service
+      dockerhub-username: ${{ vars.DOCKERHUB_USERNAME }}
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  deploy-staging:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy image to staging slot (green)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: staging
+          images: ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}
+
+      - name: Smoke test staging
+        run: |
+          url="https://${AZURE_WEBAPP_NAME}-staging.azurewebsites.net"
+          expected="${{ needs.build.outputs.image-tag }}"
+          for i in $(seq 1 30); do
+            got=$(curl -fsS "$url/version" | jq -r .version || true)
+            if [ "$got" = "$expected" ]; then
+              curl -fsS "$url/health" && echo " staging is healthy on $expected" && exit 0
+            fi
+            echo "waiting for $expected (currently: ${got:-none})"; sleep 10
+          done
+          echo "staging never came up on $expected"; exit 1
+
+  swap-to-production:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers here for a manual gate
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Swap staging -> production
+        run: |
+          az webapp deployment slot swap \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --slot staging --target-slot production
+
+      - name: Verify production
+        run: |
+          got=$(curl -fsS "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/version" | jq -r .version)
+          echo "production is serving $got"
+          test "$got" = "${{ needs.build.outputs.image-tag }}"
